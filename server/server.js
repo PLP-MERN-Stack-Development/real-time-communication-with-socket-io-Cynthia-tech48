@@ -1,132 +1,115 @@
-// server.js - Main server file for Socket.io chat application
+// src/socket/socket.js
+import { io } from "socket.io-client";
+import { useEffect, useState } from "react";
 
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
 
-// Load environment variables
-dotenv.config();
-
-// Initialize Express app
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+export const socket = io(SOCKET_URL, {
+  autoConnect: false,
+  reconnection: true,
+  reconnectionAttempts: 5,
+  reconnectionDelay: 1000,
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+export const useSocket = () => {
+  const [isConnected, setIsConnected] = useState(socket.connected);
+  const [messages, setMessages] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [typingUsers, setTypingUsers] = useState([]);
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+  // Connect to server and join room
+  const connect = (username, room = "Global") => {
+    if (!username) return;
+    socket.connect();
+    socket.emit("user_join", { username, room });
+  };
 
-// Socket.io connection handler
-io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  const disconnect = () => {
+    socket.disconnect();
+  };
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
-  });
+  const sendMessage = (message, room = "Global") => {
+    if (!message) return;
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
+    // Optimistically add message to state
+    const tempMessage = {
       id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
-  });
-
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
-
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
+      sender: socket.id, // temporary sender
       message,
+      system: false,
       timestamp: new Date().toISOString(),
-      isPrivate: true,
     };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
-  });
+    setMessages((prev) => [...prev, tempMessage]);
 
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
-    }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
-  });
-});
+    socket.emit("send_message", { message, room });
+  };
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
+  const sendPrivateMessage = (to, message) => {
+    socket.emit("private_message", { to, message });
+  };
 
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
+  const setTyping = (isTyping, room = "Global") => {
+    socket.emit("typing", { isTyping, room });
+  };
 
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
+  useEffect(() => {
+    // Connection events
+    socket.on("connect", () => setIsConnected(true));
+    socket.on("disconnect", () => setIsConnected(false));
 
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+    // Message events
+    socket.on("receive_message", (msg) => {
+      setMessages((prev) => [...prev, msg]);
+    });
 
-module.exports = { app, server, io }; 
+    socket.on("private_message", (msg) => {
+      setMessages((prev) => [...prev, msg]);
+    });
+
+    // User events
+    socket.on("user_list", (userList) => setUsers(userList));
+
+    socket.on("user_joined", (user) => {
+      setMessages((prev) => [
+        ...prev,
+        { id: Date.now(), system: true, message: `${user.username} joined the chat` },
+      ]);
+    });
+
+    socket.on("user_left", (user) => {
+      setMessages((prev) => [
+        ...prev,
+        { id: Date.now(), system: true, message: `${user.username} left the chat` },
+      ]);
+    });
+
+    // Typing indicator
+    socket.on("typing_users", (typing) => setTypingUsers(typing));
+
+    return () => {
+      socket.off("connect");
+      socket.off("disconnect");
+      socket.off("receive_message");
+      socket.off("private_message");
+      socket.off("user_list");
+      socket.off("user_joined");
+      socket.off("user_left");
+      socket.off("typing_users");
+    };
+  }, []);
+
+  return {
+    socket,
+    isConnected,
+    messages,
+    users,
+    typingUsers,
+    connect,
+    disconnect,
+    sendMessage,
+    sendPrivateMessage,
+    setTyping,
+  };
+};
+
+export default socket;
